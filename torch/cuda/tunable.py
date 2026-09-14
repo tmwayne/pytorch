@@ -988,7 +988,7 @@ def _process_single_offline_gemm(untuned_gemm_line: str, gpu_id: int) -> None:
             scaleA = torch.tensor(0.8, device=deviceid)
             scaleB = torch.tensor(0.9, device=deviceid)
             scalingTypeA = torch.nn.functional.ScalingType.TensorWise
-            scalingTypeB = torch.nn.functional.ScalingType.RowWise
+            scalingTypeB = torch.nn.functional.ScalingType.TensorWise
 
         kwargs = {
             "scale_a": scaleA,
