@@ -305,7 +305,7 @@ _tunable_scaled_gemm(
       static at::cuda::tunable::ScaledGemmTunableOp<                 \
           at::Float8_e4m3fn, at::Float8_e4m3fn, scalar_t,            \
           BLASOP_A, BLASOP_B> scaledgemm{};                          \
-      scaledgemm(&params);
+      dispatched = scaledgemm(&params) == at::cuda::tunable::OK;
 #endif
   AT_DISPATCH_V2(out_dtype, "_tunable_scaled_gemm", AT_WRAP([&] {
     bool transa_ = ((args.transa != 'n') && (args.transa != 'N'));
@@ -426,7 +426,12 @@ _scaled_gemm(
            effective_accumulator->scalar_type() == out_dtype_),
       "scaled_addmm: input and output must have the same dtype and leading dimension");
   auto tuning_ctx = at::cuda::tunable::getTuningContext();
-  bool tunable_op_enabled = tuning_ctx->IsTunableOpEnabled();
+  // TunableOp's ScaledGemmParams cannot represent the addmm accumulator/alpha/beta
+  // yet, so bypass it for epilogues (ROCm blocks the accumulator upstream, CUDA-only).
+  const bool tunable_supports_epilogue = !effective_accumulator &&
+      epilogue.alpha == 1.0f && epilogue.beta == 0.0f;
+  bool tunable_op_enabled =
+      tuning_ctx->IsTunableOpEnabled() && tunable_supports_epilogue;
   if (tunable_op_enabled) {
       // Returns false when the tunable dispatch did
       // not run the GEMM -- the selected kernel reported a non-OK status, or
