@@ -6,12 +6,7 @@
 
 #include <iterator>
 #include <memory>
-
-#ifdef _WIN32
-#include <basetsd.h> // @manual
-using ssize_t = SSIZE_T;
-#endif
-
+#include <cstddef>
 #include <c10/macros/Macros.h>
 
 /**
@@ -69,7 +64,7 @@ class Enumerator {
 
   class Proxy {
    public:
-    using difference_type = ssize_t;
+    using difference_type = typename std::iterator_traits<Iterator>::difference_type;
     using value_type = typename std::iterator_traits<Iterator>::value_type;
     using reference = typename std::iterator_traits<Iterator>::reference;
     using pointer = typename std::iterator_traits<Iterator>::pointer;
