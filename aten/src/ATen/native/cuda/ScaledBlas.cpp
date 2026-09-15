@@ -307,6 +307,15 @@ _tunable_scaled_gemm(
           BLASOP_A, BLASOP_B> scaledgemm{};                          \
       dispatched = scaledgemm(&params) == at::cuda::tunable::OK;
 #endif
+#ifdef USE_ROCM
+#define TUNABLE_SCALED_GEMM_TYPES \
+  kHalf, kBFloat16, AT_EXPAND(AT_FLOAT8_TYPES), AT_EXPAND(AT_FLOATING_TYPES)
+#define TUNABLE_SET_ALPHA(params, alpha_val)
+#else
+#define TUNABLE_SCALED_GEMM_TYPES \
+  kHalf, kBFloat16, kFloat, AT_EXPAND(AT_FLOAT8_TYPES)
+#define TUNABLE_SET_ALPHA(params, alpha_val) (params).alpha = (alpha_val)
+#endif
   AT_DISPATCH_V2(out_dtype, "_tunable_scaled_gemm", AT_WRAP([&] {
     bool transa_ = ((args.transa != 'n') && (args.transa != 'N'));
     bool transb_ = ((args.transb != 'n') && (args.transb != 'N'));
@@ -351,9 +360,7 @@ _tunable_scaled_gemm(
     params.ldc = args.result_ld;
     params.c_dtype = out_dtype;
     params.use_fast_accum = use_fast_accum;
-#ifndef USE_ROCM
-    params.alpha = alpha;
-#endif
+    TUNABLE_SET_ALPHA(params, alpha);
     // `dispatched` stays false if the selected kernel reports a non-OK status,
     // or if no branch of TUNABLE_DISPATCH matches this dtype pair; either way
     // the caller re-dispatches at::cuda::blas::scaled_gemm.
@@ -373,11 +380,9 @@ _tunable_scaled_gemm(
       TORCH_CHECK(false, "unreachable");
     }
   }),
-#ifdef USE_ROCM
-  kHalf, kBFloat16, AT_EXPAND(AT_FLOAT8_TYPES), AT_EXPAND(AT_FLOATING_TYPES));
-#else
-  kHalf, kBFloat16, kFloat, AT_EXPAND(AT_FLOAT8_TYPES));
-#endif
+  TUNABLE_SCALED_GEMM_TYPES);
+#undef TUNABLE_SET_ALPHA
+#undef TUNABLE_SCALED_GEMM_TYPES
 #undef TUNABLE_DISPATCH
   return dispatched;
 }
