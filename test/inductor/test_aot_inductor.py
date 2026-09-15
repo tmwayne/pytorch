@@ -67,6 +67,7 @@ from torch.testing._internal.common_device_type import (
     _has_sufficient_memory,
     e4m3_type,
     e5m2_type,
+    instantiate_device_type_tests,
     skipCUDAIf,
 )
 from torch.testing._internal.common_dtype import (
@@ -10800,6 +10801,39 @@ class AOTInductorCompileTimeTests(TestCase):
             metadata={"compile_id": None},
             log_level=CompileEventLogLevel.PT2_COMPILE,
         )
+
+
+class TestAOTIReturnTypes(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
+    @parametrize("op", ["max", "topk", "frexp"])
+    @parametrize("strict", [False, True])
+    def test_structseq_output(self, device, op, strict):
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                if op == "max":
+                    return torch.max(x, dim=0)
+                if op == "topk":
+                    return torch.topk(x, 2)
+                return torch.frexp(x)
+
+        model = Model()
+        x = torch.randn(4, 5, device=device)
+        expected = model(x)
+        ep = torch.export.export(model, (x,), strict=strict)
+        with tempfile.TemporaryDirectory() as directory:
+            package = torch._inductor.aoti_compile_and_package(
+                ep, package_path=os.path.join(directory, "model.pt2")
+            )
+            loaded = torch._inductor.aoti_load_package(package)
+            actual = loaded(x)
+        self.assertIs(type(actual), type(expected))
+        self.assertEqual(actual, expected)
+
+
+instantiate_device_type_tests(
+    TestAOTIReturnTypes, globals(), only_for=("cpu", "cuda", "xpu"), allow_xpu=True
+)
 
 
 class TestCheckUpperboundConfig(TestCase):
