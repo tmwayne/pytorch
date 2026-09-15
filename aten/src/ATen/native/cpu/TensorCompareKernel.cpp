@@ -367,7 +367,14 @@ void clamp_kernel_impl(TensorIteratorBase& iter) {
     if constexpr (use_vectorized_clamp<scalar_t>) {
       cpu_kernel_vec(iter, clamp_op,
         [](Vectorized<scalar_t> a, Vectorized<scalar_t> min, Vectorized<scalar_t> max) {
-          return vec::minimum(vec::maximum(a, min), max);
+          // std::max/std::min return the first argument on ties, preserving
+          // -0.0, where a hardware max returns +0.0. Mirror the scalar selects,
+          // then restore the NaN-bound case that minimum/maximum gave for free.
+          const auto lo = Vectorized<scalar_t>::blendv(min, a, a >= min);
+          const auto r = Vectorized<scalar_t>::blendv(max, lo, max >= lo);
+          return Vectorized<scalar_t>::blendv(
+            r, Vectorized<scalar_t>(std::numeric_limits<scalar_t>::quiet_NaN()),
+            (min != min) | (max != max));
         });
     } else {
       cpu_kernel(iter, clamp_op);
@@ -388,7 +395,8 @@ void clamp_scalar_kernel_impl(TensorIteratorBase& iter, const Scalar& min_, cons
       const Vectorized<scalar_t> max_vec(max);
       cpu_kernel_vec(iter, clamp_op,
         [=](Vectorized<scalar_t> a) {
-          return vec::clamp(a, min_vec, max_vec);
+          const auto lo = Vectorized<scalar_t>::blendv(a, min_vec, a < min_vec);
+          return Vectorized<scalar_t>::blendv(lo, max_vec, max_vec < lo);
         });
     } else {
       cpu_kernel(iter, clamp_op);
@@ -407,7 +415,7 @@ void clamp_max_scalar_kernel_impl(TensorIteratorBase& iter, Scalar max_) {
       const Vectorized<scalar_t> max_vec(max);
       cpu_kernel_vec(iter, clamp_max_op,
         [=](Vectorized<scalar_t> a) {
-          return vec::clamp_max(a, max_vec);
+          return Vectorized<scalar_t>::blendv(a, max_vec, max_vec < a);
         });
     } else {
       cpu_kernel(iter, clamp_max_op);
@@ -426,7 +434,7 @@ void clamp_min_scalar_kernel_impl(TensorIteratorBase& iter, Scalar min_) {
       const Vectorized<scalar_t> min_vec(min);
       cpu_kernel_vec(iter, clamp_min_op,
         [=](Vectorized<scalar_t> a) {
-          return vec::clamp_min(a, min_vec);
+          return Vectorized<scalar_t>::blendv(a, min_vec, a < min_vec);
         });
     } else {
       cpu_kernel(iter, clamp_min_op);
