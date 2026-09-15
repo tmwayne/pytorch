@@ -605,6 +605,23 @@ class ModeBranchGlobalModule(torch.nn.Module):
         return x * 2
 
 
+class SetIterModule(torch.nn.Module):
+    # Iterating a set guards each element through a set-index accessor, which
+    # reports a failure with NO verbose code parts when the set it is asked about
+    # is shorter than the index it recorded.
+    def forward(self, x, tags):
+        total = 0
+        for _ in tags:
+            total += 1
+        return x * total
+
+
+def drop_sequence_length_guards(guard_entries):
+    # SEQUENCE_LENGTH is the guard that would otherwise name a set of the wrong
+    # size before the per-element accessors are reached.
+    return [g.guard_type != "SEQUENCE_LENGTH" for g in guard_entries]
+
+
 class TensorDefaultModule(torch.nn.Module):
     # A tensor default makes inspect.Signature equality raise (Parameter.__eq__
     # takes bool() of `default == default`), whether or not the body reads it.
@@ -2012,6 +2029,113 @@ from user code:
         )
         self.assertEqual(reloaded(x), ReturnsBuiltinModule()(x))
 
+    def test_aot_compile_module_no_match_error(self):
+        # Two inputs, so the message has to account for both rather than
+        # reporting only the first one's guard failure. Vary dtype rather than
+        # shape: aot_compile_module does not forward `dynamic`, so a second
+        # shape goes automatic-dynamic and would subsume the unmatched input.
+        # No graph runs on this path, so eager keeps the report identical.
+        model = torch.compile(ScaleModule(), fullgraph=True, backend="eager")
+        model._aot_compile(
+            [
+                ModelInput(
+                    args=(torch.randn(3, 3, dtype=torch.float32),),
+                    kwargs={},
+                    contexts=[],
+                ),
+                ModelInput(
+                    args=(torch.randn(3, 3, dtype=torch.float64),),
+                    kwargs={},
+                    contexts=[],
+                ),
+            ]
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            model(torch.randn(3, 3, dtype=torch.float16))
+        message = str(ctx.exception)
+        self.assertIn("No AOT compiled graph matched this call", message)
+        self.assertIn("Tried 2 compiled input(s)", message)
+        self.assertIn("[0]", message)
+        self.assertIn("[1]", message)
+        # One line per input, not a multi-line GuardDebugInfo repr per input: the
+        # two entries are the two lines after the header, and the advice that
+        # follows is not indented, so it is not a continuation of the second.
+        lines = message.splitlines()
+        self.assertEqual([line[:5] for line in lines[1:3]], ["  [0]", "  [1]"])
+        self.assertFalse(lines[3].startswith(" "), lines[3])
+        self.assertIn("Add a ModelInput", message)
+
+    def test_no_match_report_keeps_an_entry_on_one_line_past_odd_separators(self):
+        # A verbose code part embeds the guard's own source line, which the read
+        # producing it ends only at \n, so every other separator splitlines()
+        # breaks on -- a comment can carry the three below -- survives into the
+        # report, where splitlines() reads the entry-per-line format back.
+        src = (
+            "import torch\n"
+            "\n"
+            "\n"
+            "class OddSepModule(torch.nn.Module):\n"
+            "    def forward(self, x, mode):\n"
+            "        if mode == 1:  # page\x0cbreak\x1erec\u2028sep\n"
+            "            return x * 2\n"
+            "        return x * 3\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "aot_odd_sep_mod.py")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(src)
+            sys.path.insert(0, tmp)
+            self.addCleanup(sys.path.remove, tmp)
+            self.addCleanup(sys.modules.pop, "aot_odd_sep_mod", None)
+            mod = importlib.import_module("aot_odd_sep_mod")
+            x = torch.randn(3, 3)
+            model = torch.compile(mod.OddSepModule(), fullgraph=True, backend="eager")
+            model._aot_compile([ModelInput(args=(x, 1), kwargs={}, contexts=[])])
+            with self.assertRaises(RuntimeError) as ctx:
+                model(x, 2)
+        message = str(ctx.exception)
+        lines = message.splitlines()
+        self.assertEqual(len(lines), 3, message)
+        self.assertTrue(lines[1].startswith("  [0] L['mode'] == 1"), lines[1])
+        self.assertIn("Add a ModelInput", lines[2])
+        # The source has no spaces there, so this says all three separators
+        # arrived in the part and were collapsed -- without which the test is
+        # vacuous, and the last two a form-feed replace would not cover.
+        self.assertIn("page break rec sep", message)
+
+    def test_no_match_message_keeps_the_advice_for_every_entry(self):
+        # One entry names a missing global and the other is a plain mismatch, and
+        # neither advice covers the other's entry: defining AOT_BRANCH_SCALE
+        # cannot make mode=2 satisfy [1]'s L['mode'] == 1, and a new ModelInput
+        # for mode=2 would not resolve the global [1] failed on. Reporting only
+        # one of them asserts something untrue about the whole call.
+        model = torch.compile(
+            ModeBranchGlobalModule(),
+            fullgraph=True,
+            backend="eager",
+            options={"guard_filter_fn": keep_global_guards},
+        )
+        x = torch.randn(3, 3)
+        model._aot_compile(
+            [
+                ModelInput(args=(x, 0), kwargs={}, contexts=[]),
+                ModelInput(args=(x, 1), kwargs={}, contexts=[]),
+            ]
+        )
+        g = globals()
+        saved = g.pop("AOT_BRANCH_SCALE")
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                model(x, 2)
+            message = str(ctx.exception)
+        finally:
+            g["AOT_BRANCH_SCALE"] = saved
+        self.assertIn("[0] L['mode'] == 0", message)
+        self.assertIn("[1] KeyError on G['AOT_BRANCH_SCALE']", message)
+        self.assertIn("For [1]: a guarded global is missing", message)
+        self.assertIn("the module the compiled function was traced in", message)
+        self.assertIn("Add a ModelInput", message)
+
     def _install_global_probe(self, name, misses):
         # Re-keys this module's global `name` under a CountedKey. Both cleanups
         # are registered before the dict is touched, so an interrupt anywhere
@@ -2026,7 +2150,7 @@ from user code:
         self.addCleanup(g.pop, probe, None)
         del g[name]
         g[probe] = saved
-        return saved
+        return probe, saved
 
     def test_module_dispatch_evaluates_a_matching_tree_once(self):
         # The scan calls the matching result's declared `fn` field rather than the
@@ -2062,7 +2186,16 @@ from user code:
 
         with patch.object(AOTCompiledFunction, "prepare_f_locals", counted):
             self.assertEqual(model(xs[3]), mod(xs[3]))
-        self.assertEqual(len(binds), 1)
+            self.assertEqual(len(binds), 1)
+            binds.clear()
+            with self.assertRaises(RuntimeError) as ctx:
+                model(torch.ones(3, 3, dtype=torch.float16))
+            self.assertEqual(len(binds), 1)
+        # One entry per result off that single bind, whatever else the report
+        # carries.
+        lines = str(ctx.exception).splitlines()
+        self.assertEqual(sum(line.startswith("  [") for line in lines), len(xs))
+        self.assertIn("Add a ModelInput", str(ctx.exception))
 
     def test_module_dispatch_decides_a_shared_binding_past_the_first_result(self):
         # Whether results bind alike is decided once a call reaches a second
@@ -2126,7 +2259,7 @@ from user code:
         self.assertTrue(combined._binds_alike(tuple(combined.compiled_results)))
         combined.compiled_results[1] = aot_compile_forward(mod, doubles, x.double(), 1)
         self.assertEqual(combined(x.double(), 1), x.double() * 3)
-        with self.assertRaisesRegex(RuntimeError, "GuardManager check failed"):
+        with self.assertRaisesRegex(RuntimeError, "No AOT compiled graph matched"):
             combined(x.double())
         self.assertFalse(combined._binds_alike(tuple(combined.compiled_results)))
 
@@ -2162,7 +2295,7 @@ from user code:
             return check(f_locals)
 
         with patch.object(manager, "check", appending_check):
-            with self.assertRaisesRegex(RuntimeError, "GuardManager check failed"):
+            with self.assertRaisesRegex(RuntimeError, "No AOT compiled graph matched"):
                 combined(x.double())
         self.assertIs(combined.compiled_results[1], later)
         self.assertEqual(combined(x.double()), x.double() * 2)
@@ -2242,7 +2375,7 @@ from user code:
             return binds_alike(model, results)
 
         with patch.object(AOTCompiledModel, "_binds_alike", racing):
-            with self.assertRaisesRegex(RuntimeError, "GuardManager check failed"):
+            with self.assertRaisesRegex(RuntimeError, "No AOT compiled graph matched"):
                 combined(x.double())
             release.set()
             decider.join()
@@ -2271,7 +2404,7 @@ from user code:
         # the next lookup, so the scan rejects [1] and the re-check accepts it:
         # the call is served [1]'s graph at the cost of one more check() of its
         # tree.
-        saved = self._install_global_probe("AOT_BRANCH_SCALE", misses=1)
+        _, saved = self._install_global_probe("AOT_BRANCH_SCALE", misses=1)
         manager = model.forward.compiled_results[1]._artifacts.guard_manager
         with patch.object(manager, "check", wraps=manager.check) as check:
             out = model(x, 1)
@@ -2346,7 +2479,7 @@ from user code:
         if leading_opt_outs:
             self.assertEqual(model(x, 2), x * 2)
         else:
-            with self.assertRaisesRegex(RuntimeError, "GuardManager check failed"):
+            with self.assertRaisesRegex(RuntimeError, "No AOT compiled graph matched"):
                 model(x, 2)
 
     def test_aot_compile_module_disable_guard_check(self):
@@ -2513,6 +2646,87 @@ from user code:
         self.assertFalse(loaded._binds_alike(tuple(loaded.compiled_results)))
         for x in xs:
             self.assertEqual(loaded(x), x * 3)
+
+    def test_no_match_message_when_a_guard_answers_inconsistently(self):
+        # Both dispatch passes ran [1]'s whole tree and both rejected the call,
+        # so an accept while the report asks why contradicts them rather than
+        # correcting them: neither the guards it just passed nor "add a
+        # ModelInput" says anything true about that entry.
+        mod = ModeBranchGlobalModule()
+        model = torch.compile(
+            mod,
+            fullgraph=True,
+            backend="eager",
+            options={"guard_filter_fn": keep_global_guards},
+        )
+        x = torch.randn(3, 3)
+        model._aot_compile(
+            [
+                ModelInput(args=(x, 0), kwargs={}, contexts=[]),
+                ModelInput(args=(x, 1), kwargs={}, contexts=[]),
+            ]
+        )
+        probe, _ = self._install_global_probe("AOT_BRANCH_SCALE", misses=2)
+        with self.assertRaises(RuntimeError) as ctx:
+            model(x, 1)
+        message = str(ctx.exception)
+        # Two rejections in dispatch, then the report's accept: one lookup per
+        # evaluation, since one accessor is rooted at the global and the dict-tag
+        # fast path that would skip it is off -- the probe's pop/insert bumped
+        # this module dict's version past the one the last accept recorded.
+        self.assertEqual(probe.compares, 3)
+        self.assertIn("[1] <guards rejected this call twice and then accepted", message)
+        # [0] is a real mismatch, so its advice still applies to the call.
+        self.assertIn("[0] L['mode'] == 0", message)
+        self.assertIn("Add a ModelInput", message)
+
+    def test_no_match_message_when_a_failure_names_no_guard(self):
+        # A set index past the end of a shorter set answers
+        # GuardDebugInfo(false, 0): the call did NOT match, yet there is no
+        # verbose code part to quote, so an empty list cannot stand for "this tree
+        # passed" -- reason.result is what says that. Read as a pass, this call
+        # gets served a graph compiled for a set of another size.
+        model = torch.compile(
+            SetIterModule(),
+            fullgraph=True,
+            backend="eager",
+            options={"guard_filter_fn": drop_sequence_length_guards},
+        )
+        x = torch.randn(3, 3)
+        one, two = object(), object()
+        model._aot_compile([ModelInput(args=(x, {one, two}), kwargs={}, contexts=[])])
+        with self.assertRaises(RuntimeError) as ctx:
+            model(x, {one})
+        message = str(ctx.exception)
+        self.assertIn("[0] <guard check failed without naming a guard>", message)
+        self.assertIn("Add a ModelInput", message)
+
+    def test_no_match_report_names_the_results_the_dispatch_judged(self):
+        # compiled_results is public, and the report indexes the binding the
+        # dispatch built, one per result the call began with. [0]'s check()
+        # appends a result mid-call: a report that re-read the list would ask for
+        # a binding the dispatch never made, and an IndexError would take its
+        # place. The appended result is the next call's to judge.
+        mod, x = ScaleModule(), torch.randn(3, 3)
+        first = aot_compile_forward(mod, make_scaling_forward(2), x)
+        later = aot_compile_forward(mod, make_scaling_forward(3), x)
+        combined = AOTCompiledModel(mod, [first])
+        manager = first._live_guard_manager()
+        check = manager.check
+
+        def appending_check(f_locals):
+            combined.compiled_results[1:] = [later]
+            return check(f_locals)
+
+        with patch.object(manager, "check", appending_check):
+            with self.assertRaises(RuntimeError) as ctx:
+                combined(x.double())
+        lines = str(ctx.exception).splitlines()
+        self.assertIn("Tried 1 compiled input(s)", lines[0])
+        self.assertEqual(sum(line.startswith("  [") for line in lines), 1)
+        with self.assertRaises(RuntimeError) as ctx:
+            combined(x.double())
+        self.assertIn("Tried 2 compiled input(s)", str(ctx.exception))
 
     def test_aot_compile_module_scope_resolves_through_forward_hook(self):
         # A registered forward hook makes get_traced_fn(model) return
