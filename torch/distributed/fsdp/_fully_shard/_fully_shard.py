@@ -419,6 +419,20 @@ class FSDPModule:
         both reduce-scatter and all-reduce together. This is the equivalence of
         `no_sync` in FSDP1.
 
+        After a backward without synchronization, ``model.parameters()`` exposes
+        the accumulated gradients as DTensors with ``Partial("avg")`` placements
+        on the data-parallel mesh dimensions. Their local tensors contain the
+        unsharded gradients in the effective ``MixedPrecisionPolicy.reduce_dtype``.
+        The visible parameter's ``grad_dtype`` temporarily matches this dtype;
+        synchronization restores the sharded gradient dtype specified before
+        :func:`fully_shard`. Clearing these gradients with ``zero_grad()`` clears
+        the accumulation. With a custom gradient divide factor, the placements
+        are ``Partial("sum")`` and the factor is applied during synchronization.
+        Before starting unsynchronized fp16 accumulation, clear any previously
+        reduced gradients with ``zero_grad(set_to_none=True)``.
+        This is also required for ``spmd_types`` gradients whose non-DP
+        placements differ from the parameter's placements.
+
         Args:
             requires_gradient_sync (bool): Whether to reduce gradients for the
                 module's parameters.
@@ -441,6 +455,9 @@ class FSDPModule:
         Sets if the module should all-reduce gradients. This can be used to
         implement gradient accumulation with only reduce-scatter but not
         all-reduce for HSDP.
+
+        Before converting the dtype of gradients awaiting all-reduce, complete
+        a backward for the affected modules with all-reduce enabled.
         """
         self_module = cast(nn.Module, self)
         modules = list(self_module.modules()) if recurse else [self_module]
@@ -495,6 +512,10 @@ class FSDPModule:
         be used during gradient accumulation to trade off higher memory for
         reduced communication since the unsharded parameters do not need to be
         re-all-gathered before the next forward.
+
+        Updates to the exposed sharded parameters must run consistently across
+        ranks while retaining unsharded parameters. Before rank-specific local
+        shard updates, call :meth:`reshard` on every rank.
 
         Args:
             reshard_after_backward (bool): Whether to reshard parameters after
@@ -883,10 +904,41 @@ class FSDPModule:
             raise AssertionError(f"No FSDP state found on {self}")
         return state
 
-    def _apply(self, *args: Any, **kwargs: Any) -> Any:
+    def _apply(
+        self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True
+    ) -> Any:
+        self_module = cast(nn.Module, self)
+        modules = set(self_module.modules()) if recurse else {self_module}
+        visited_states: set[FSDPState] = set()
+        with torch.no_grad():
+            for module in modules:
+                if not isinstance(module, FSDPModule):
+                    continue
+                state = module._get_fsdp_state()
+                if state in visited_states:
+                    continue
+                visited_states.add(state)
+                for group in state._fsdp_param_groups:
+                    pending_grad = group._partial_reduce_output
+                    if pending_grad is None:
+                        continue
+                    if not any(
+                        param._module_info.module in modules
+                        or any(m in modules for m in param._module_info.shared_modules)
+                        for param in group.fsdp_params
+                    ):
+                        continue
+                    # Probe dtype conversion without reading or modifying the
+                    # accumulated gradient, which is not visited by Module._apply.
+                    if fn(pending_grad.new_empty(0)).dtype != pending_grad.dtype:
+                        raise RuntimeError(
+                            "Cannot change the dtype of gradients awaiting all-reduce. "
+                            "Complete a backward for the affected modules with "
+                            "all-reduce enabled before converting their dtype."
+                        )
         # Reshard to ensure that sharded parameters are registered
         self.reshard()
-        ret = super()._apply(*args, **kwargs)  # type: ignore[misc]
+        ret = super()._apply(fn, recurse=recurse)  # type: ignore[misc]
         state = self._get_fsdp_state()
         if not state._fsdp_param_groups:
             return ret
@@ -895,7 +947,10 @@ class FSDPModule:
         with torch.no_grad():
             for fsdp_param_group in state._fsdp_param_groups:
                 for fsdp_param in fsdp_param_group.fsdp_params:
-                    fsdp_param.reset_sharded_param()
+                    fsdp_param.reset_sharded_param(reset_dtype=True)
+                # Grouped modules are converted one at a time. Validate their
+                # common dtype on the next unshard, after conversion finishes.
+                fsdp_param_group._mp_dtypes_initialized = False
         return ret
 
 

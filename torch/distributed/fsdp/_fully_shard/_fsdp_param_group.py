@@ -194,6 +194,7 @@ class FSDPParamGroup:
         # Only consider resetting sharded parameters once in lazy init since it
         # can incur nontrivial overhead to reset them
         self._reset_sharded_params: bool = False
+        self._mp_dtypes_initialized: bool = False
 
         # - Hook state
         self._module_to_pre_save_state_dict_hook_handle: _ModuleToHandleDict = {}
@@ -302,6 +303,7 @@ class FSDPParamGroup:
         self._reduce_dtype = (
             next(iter(reduce_dtypes)) if dtype_sets_are_uniform else None
         )
+        self._mp_dtypes_initialized = True
 
     def lazy_init(self):
         # Lazy init should be idempotent
@@ -380,10 +382,26 @@ class FSDPParamGroup:
     # Runtime #
     @_disable_functorch_if_active
     def unshard(self, async_op: bool = False):
+        if not self._mp_dtypes_initialized:
+            self._init_mp_dtypes()
         if self._all_gather_result is not None:  # already called, pending wait
             return
         if self.is_unsharded:
-            return  # no-op
+            if all(
+                fsdp_param._sharded_param_version is None
+                or (
+                    fsdp_param.sharded_param._version,
+                    fsdp_param._sharded_local_tensor._version,
+                )
+                == fsdp_param._sharded_param_version
+                for fsdp_param in self.fsdp_params
+            ):
+                for fsdp_param in self.fsdp_params:
+                    fsdp_param.to_unsharded()
+                return
+            # An optimizer may update the published sharded parameter while
+            # its unsharded allocation is retained across backwards.
+            self._to_sharded()
         if (
             not self.unshard_in_backward
             and self._training_state == TrainingState.PRE_BACKWARD
@@ -562,6 +580,8 @@ class FSDPParamGroup:
                 self.unshard(self.unshard_async_op)
                 self.wait_for_unshard()
             for fsdp_param in self.fsdp_params:
+                if not fsdp_param.offload_to_cpu:
+                    fsdp_param.restore_unsharded_grad()
                 fsdp_param._restore_spmd_types(fsdp_param.unsharded_param)
             if entering_forward_pass:
                 args, kwargs = self._register_post_backward_hook(args, kwargs)
@@ -578,8 +598,21 @@ class FSDPParamGroup:
             if not is_bw():
                 self.reshard()
                 self._record_post_forward()
+                self._register_cpu_grad_owners()
             self._training_state = TrainingState.IDLE
             return output
+
+    def _register_cpu_grad_owners(self) -> None:
+        if (
+            isinstance(self.offload_policy, CPUOffloadPolicy)
+            and self.is_unsharded
+            and not is_bw()
+        ):
+            # Expose CPU accumulation to zero_grad() after forward, including
+            # partial group forwards that retain the compute weights.
+            for fsdp_param in self.fsdp_params:
+                if fsdp_param._grad_is_partial:
+                    fsdp_param._setattr_on_modules(fsdp_param.sharded_param)
 
     def _record_post_forward(self) -> None:
         # Since a group has one pre-backward unshard for each forward call
@@ -600,12 +633,17 @@ class FSDPParamGroup:
             self._training_state = TrainingState.PRE_BACKWARD
             self.unshard(self.unshard_async_op)  # no-op if prefetched
             self.wait_for_unshard()
+            for fsdp_param in self.fsdp_params:
+                if self.reduce_grads or not fsdp_param.offload_to_cpu:
+                    fsdp_param.restore_unsharded_grad()
             if default_prefetch:
                 self._backward_prefetch()
 
     @_dynamo_disable
     def post_backward(self, *unused: Any):
         with _spmd_no_typecheck():
+            if not self._mp_dtypes_initialized:
+                self._init_mp_dtypes()
             # This method should be idempotent and safe to call even when this
             # FSDP parameter group was not used in backward (should be a no-op)
             logger.debug("%s", self._with_fqn("FSDP::post_backward"))
@@ -620,15 +658,15 @@ class FSDPParamGroup:
                 and self._training_state == TrainingState.FORWARD  # partial path taken
             )
             self._training_state = TrainingState.POST_BACKWARD
-            with record_function(self._with_fqn("FSDP::post_backward_accumulate")):
-                for fsdp_param in self.fsdp_params:
-                    fsdp_param.accumulate_unsharded_grad_if_needed()
             with record_function(self._with_fqn("FSDP::post_backward_reshard")):
                 if not self.reduce_grads:
+                    reduce_op = "avg" if self.gradient_divide_factor is None else "sum"
+                    for fsdp_param in self.fsdp_params:
+                        fsdp_param.publish_unsharded_grad(
+                            reduce_op, self.gradient_divide_factor
+                        )
                     if self.reshard_after_backward:
                         self.reshard()
-                    for fsdp_param in self.fsdp_params:
-                        fsdp_param.to_accumulated_grad_if_needed()
                     return
                 # Save the autograd-computed gradients before resharding to only
                 # access the unsharded parameters when their data is present
@@ -638,15 +676,10 @@ class FSDPParamGroup:
                 for fsdp_param in self.fsdp_params:
                     if not hasattr(fsdp_param, "_unsharded_param"):
                         continue
-                    # May have an accumulated gradient of the reduce dtype if the
-                    # previous backward did not reduce-scatter
-                    if fsdp_param.unsharded_accumulated_grad is not None:
-                        fsdp_params_with_grad.append(fsdp_param)
-                        unsharded_grads.append(
-                            fsdp_param.unsharded_accumulated_grad_data
-                        )
-                        fsdp_param.unsharded_accumulated_grad = None
-                    elif fsdp_param.unsharded_param.grad is not None:
+                    # A group unused in this microbatch may still own gradients
+                    # from an earlier backward without synchronization.
+                    fsdp_param.restore_unsharded_grad()
+                    if fsdp_param.unsharded_param.grad is not None:
                         fsdp_params_with_grad.append(fsdp_param)
                         unsharded_grads.append(fsdp_param.unsharded_grad_data)
                         fsdp_param.unsharded_param.grad = None
@@ -658,6 +691,9 @@ class FSDPParamGroup:
                         unsharded_grads.append(fsdp_param.unsharded_zero_grad_data)
                 if self.reshard_after_backward:
                     self.reshard()
+                else:
+                    for fsdp_param in self.fsdp_params:
+                        fsdp_param._setattr_on_modules(fsdp_param.sharded_param)
             # Recycle prior modules' reduce-scatter input buffers, keeping at most
             # `max_input_buffers` in flight: reclaim the oldest (wait on its
             # reduce-scatter, then drop the keepalive ref that was deferring the
@@ -720,7 +756,6 @@ class FSDPParamGroup:
                     ),
                     self.comm_ctx.reduce_scatter_stream,
                     self._reduce_scatter_comm,
-                    self._orig_dtype,
                     self._reduce_dtype,
                     self.device,
                     self.gradient_divide_factor,
